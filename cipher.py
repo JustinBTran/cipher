@@ -5,14 +5,17 @@ Encrypts with AES-256-GCM. The key is derived from your keyphrase with scrypt,
 so the keyphrase is the whole ballgame: a long one is unguessable, a short one
 is the way in. The same keyphrase both encrypts and decrypts.
 
-    ./cipher.py encrypt notes.txt -k "my long secret keyphrase"
-    ./cipher.py decrypt notes.txt.cipher -k "my long secret keyphrase"
+    ./cipher.py encrypt notes.txt          -> writes notes.txt.cipher
+    ./cipher.py decrypt notes.txt.cipher   -> prints the text to stdout
 
-Leave off -k and it prompts without echoing, which keeps the keyphrase out of
-your shell history:
+Decrypt prints by default and writes nothing, so reading a document leaves no
+decrypted copy behind. Pass -o PATH or -w when you do want the file back:
 
-    ./cipher.py encrypt notes.txt          -> notes.txt.cipher
-    ./cipher.py decrypt notes.txt.cipher   -> notes.txt
+    ./cipher.py decrypt notes.txt.cipher | less
+    ./cipher.py decrypt notes.txt.cipher -w        -> writes notes.txt
+
+Both commands prompt for the keyphrase without echoing. -k takes it inline
+instead, at the cost of leaving it in your shell history.
 
 Format of a .cipher file (the header is authenticated, so editing any of it
 makes decryption fail rather than silently changing the result):
@@ -296,17 +299,19 @@ def warn(message: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def resolve_outputs(
-    args: argparse.Namespace, decrypting: bool
-) -> list[tuple[Path, Path]]:
-    sources = [Path(s) for s in args.files]
-
+def validate_sources(files: list[str]) -> list[Path]:
+    sources = [Path(s) for s in files]
     for src in sources:
         if not src.exists():
             raise CipherError(f"{src} does not exist")
         if not src.is_file():
             raise CipherError(f"{src} is not a regular file")
+    return sources
 
+
+def resolve_outputs(
+    args: argparse.Namespace, sources: list[Path], decrypting: bool
+) -> list[tuple[Path, Path]]:
     if args.output:
         if len(sources) != 1:
             raise CipherError("-o/--output only works with a single input file")
@@ -324,7 +329,8 @@ def resolve_outputs(
 
 
 def cmd_encrypt(args: argparse.Namespace) -> int:
-    pairs = resolve_outputs(args, decrypting=False)
+    sources = validate_sources(args.files)
+    pairs = resolve_outputs(args, sources, decrypting=False)
 
     # An empty input is almost always a mistake: a typo'd filename, or a file
     # that moved. Encrypting it yields a 58-byte vault holding nothing, which
@@ -347,11 +353,11 @@ def cmd_encrypt(args: argparse.Namespace) -> int:
     for src, dst in pairs:
         blob = encrypt_bytes(read_file(src), keyphrase, args.log_n, args.r, args.p)
         write_atomic(dst, blob)
-        print(f"{src} -> {dst}")
+        print(f"{src} -> {dst}", file=sys.stderr)
         if args.remove_source:
             try:
                 src.unlink()
-                print(f"  removed {src}")
+                print(f"  removed {src}", file=sys.stderr)
             except OSError as exc:
                 raise CipherError(f"encrypted fine, but could not remove {src}: {exc}")
 
@@ -359,15 +365,56 @@ def cmd_encrypt(args: argparse.Namespace) -> int:
 
 
 def cmd_decrypt(args: argparse.Namespace) -> int:
-    pairs = resolve_outputs(args, decrypting=True)
+    """Print the plaintext by default; only touch the disk if asked to.
+
+    Reading a document should not leave a decrypted copy lying around, so
+    writing one is opt-in via -o PATH or -w.
+    """
+    sources = validate_sources(args.files)
+
+    if args.output or args.write:
+        pairs = resolve_outputs(args, sources, decrypting=True)
+    else:
+        pairs = [(src, None) for src in sources]
+
     keyphrase = get_keyphrase(args, confirm=False)
 
     for src, dst in pairs:
         plaintext = decrypt_bytes(read_file(src), keyphrase)
-        write_atomic(dst, plaintext)
-        print(f"{src} -> {dst}")
+        if dst is None:
+            emit_plaintext(plaintext, src)
+        else:
+            write_atomic(dst, plaintext)
+            # stderr, so stdout stays usable as a pure data channel
+            print(f"{src} -> {dst}", file=sys.stderr)
 
     return 0
+
+
+def emit_plaintext(data: bytes, src: Path) -> None:
+    """Write plaintext to stdout byte-for-byte.
+
+    No trailing newline is added: `cipher decrypt f | sha256sum` has to match
+    the original file's hash, and inventing a byte would break that.
+    """
+    if sys.stdout.isatty() and looks_binary(data):
+        raise CipherError(
+            f"{src} decrypts to binary data; pass -o PATH, or redirect stdout"
+        )
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def looks_binary(data: bytes) -> bool:
+    """Only used to avoid blasting control codes at a terminal. A pipe gets the
+    bytes regardless -- the caller may well be expecting binary."""
+    if b"\x00" in data:
+        return True
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
 
 
 def cmd_info(args: argparse.Namespace) -> int:
@@ -446,9 +493,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_keyphrase_flags(enc)
     enc.set_defaults(func=cmd_encrypt)
 
-    dec = sub.add_parser("decrypt", help="decrypt one or more files")
+    dec = sub.add_parser(
+        "decrypt",
+        help="decrypt one or more files, printing to stdout",
+        description="Prints the plaintext to stdout. Pass -o or -w to write a file instead.",
+    )
     dec.add_argument("files", nargs="+")
-    dec.add_argument("-o", "--output", help="output path (single input only)")
+    dest = dec.add_mutually_exclusive_group()
+    dest.add_argument("-o", "--output", help="write to this path (single input only)")
+    dest.add_argument(
+        "-w",
+        "--write",
+        action="store_true",
+        help="write to the default name (strips the .cipher suffix)",
+    )
     dec.add_argument(
         "-f", "--force", action="store_true", help="overwrite existing output"
     )

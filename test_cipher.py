@@ -129,7 +129,7 @@ class CommandLine(unittest.TestCase):
         """-k on both sides, the main thing the flag exists for."""
         doc = self.path / "notes.txt"
         doc.write_text("my private notes\nline two\n")
-        original = doc.read_bytes()
+        original = doc.read_text()
 
         self.run_cli("encrypt", "notes.txt", "-k", PHRASE, "--log-n", "10")
         enc = self.path / "notes.txt.cipher"
@@ -137,8 +137,96 @@ class CommandLine(unittest.TestCase):
         self.assertNotIn(b"private", enc.read_bytes())
 
         doc.unlink()
-        self.run_cli("decrypt", "notes.txt.cipher", "-k", PHRASE)
-        self.assertEqual(doc.read_bytes(), original)
+        proc = self.run_cli("decrypt", "notes.txt.cipher", "-k", PHRASE)
+        self.assertEqual(proc.stdout, original)
+
+    # -- decrypt writes nothing unless told to ----------------------------
+
+    def test_decrypt_prints_and_writes_nothing(self):
+        (self.path / "a.txt").write_text("plain content here")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        (self.path / "a.txt").unlink()
+
+        proc = self.run_cli("decrypt", "a.txt.cipher", "-k", PHRASE)
+        self.assertEqual(proc.stdout, "plain content here")
+        self.assertFalse(
+            (self.path / "a.txt").exists(), "left a decrypted file on disk"
+        )
+
+    def test_stdout_is_byte_exact(self):
+        """No added or stripped newline -- piping to a hash must match the
+        original file."""
+        for body in ["no trailing newline", "with one\n", "two\n\n", ""]:
+            with self.subTest(body=body):
+                src = self.path / "b.txt"
+                src.write_text(body or "placeholder")
+                if not body:
+                    src.write_text("")
+                enc = self.path / "b.txt.cipher"
+                enc.unlink(missing_ok=True)
+                args = ["encrypt", "b.txt", "-k", PHRASE, "--log-n", "10"]
+                if not body:
+                    args.append("--allow-empty")
+                self.run_cli(*args)
+                proc = self.run_cli("decrypt", "b.txt.cipher", "-k", PHRASE)
+                self.assertEqual(proc.stdout, body)
+
+    def test_status_messages_stay_off_stdout(self):
+        """stdout is the data channel; 'a.txt -> a.txt.cipher' must not pollute
+        it or piping decrypt output would be corrupted."""
+        (self.path / "a.txt").write_text("content")
+        proc = self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("a.txt.cipher", proc.stderr)
+
+        proc = self.run_cli("decrypt", "a.txt.cipher", "-w", "-f", "-k", PHRASE)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("a.txt", proc.stderr)
+
+    def test_write_flag_restores_default_name(self):
+        (self.path / "a.txt").write_text("restored content")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        (self.path / "a.txt").unlink()
+
+        self.run_cli("decrypt", "a.txt.cipher", "-w", "-k", PHRASE)
+        self.assertEqual((self.path / "a.txt").read_text(), "restored content")
+
+    def test_write_flag_respects_force(self):
+        (self.path / "a.txt").write_text("new")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        (self.path / "a.txt").write_text("do not clobber me")
+
+        self.run_cli("decrypt", "a.txt.cipher", "-w", "-k", PHRASE, expect_ok=False)
+        self.assertEqual((self.path / "a.txt").read_text(), "do not clobber me")
+
+    def test_output_and_write_are_mutually_exclusive(self):
+        (self.path / "a.txt").write_text("x")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        proc = self.run_cli(
+            "decrypt", "a.txt.cipher", "-w", "-o", "out.txt", "-k", PHRASE,
+            expect_ok=False,
+        )
+        self.assertIn("not allowed with", proc.stderr)
+
+    def test_multiple_files_concatenate_on_stdout(self):
+        (self.path / "a.txt").write_text("AAA")
+        (self.path / "b.txt").write_text("BBB")
+        self.run_cli("encrypt", "a.txt", "b.txt", "-k", PHRASE, "--log-n", "10")
+        proc = self.run_cli("decrypt", "a.txt.cipher", "b.txt.cipher", "-k", PHRASE)
+        self.assertEqual(proc.stdout, "AAABBB")
+
+    def test_binary_plaintext_survives_a_pipe(self):
+        """stdout is not a tty under subprocess, so binary must pass through
+        untouched rather than hitting the terminal guard."""
+        blob = bytes(range(1, 256))
+        (self.path / "bin.dat").write_bytes(blob)
+        self.run_cli("encrypt", "bin.dat", "-k", PHRASE, "--log-n", "10")
+        proc = subprocess.run(
+            CLI + ["decrypt", "bin.dat.cipher", "-k", PHRASE],
+            capture_output=True, env=self.env, cwd=self.path,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, blob)
 
     def test_keyphrase_flag_warns_about_shell_history(self):
         (self.path / "a.txt").write_text("x")
@@ -149,9 +237,8 @@ class CommandLine(unittest.TestCase):
         phrase = "a phrase with spaces, 'quotes' and $dollar signs"
         (self.path / "a.txt").write_text("content")
         self.run_cli("encrypt", "a.txt", "-k", phrase, "--log-n", "10")
-        (self.path / "a.txt").unlink()
-        self.run_cli("decrypt", "a.txt.cipher", "-k", phrase)
-        self.assertEqual((self.path / "a.txt").read_text(), "content")
+        proc = self.run_cli("decrypt", "a.txt.cipher", "-k", phrase)
+        self.assertEqual(proc.stdout, "content")
 
     def test_short_keyphrase_warns_but_proceeds(self):
         (self.path / "a.txt").write_text("x")
@@ -162,9 +249,8 @@ class CommandLine(unittest.TestCase):
     def test_keyphrase_env(self):
         (self.path / "a.txt").write_text("env content")
         self.run_cli("encrypt", "a.txt", "--keyphrase-env", "CIPHER_PHRASE", "--log-n", "10")
-        (self.path / "a.txt").unlink()
-        self.run_cli("decrypt", "a.txt.cipher", "--keyphrase-env", "CIPHER_PHRASE")
-        self.assertEqual((self.path / "a.txt").read_text(), "env content")
+        proc = self.run_cli("decrypt", "a.txt.cipher", "--keyphrase-env", "CIPHER_PHRASE")
+        self.assertEqual(proc.stdout, "env content")
 
     def test_keyphrase_file_ignores_trailing_newline(self):
         """A keyphrase file written by an editor has a trailing newline; it must
@@ -172,9 +258,8 @@ class CommandLine(unittest.TestCase):
         (self.path / "phrase.txt").write_text(PHRASE + "\n")
         (self.path / "a.txt").write_text("file content")
         self.run_cli("encrypt", "a.txt", "--keyphrase-file", "phrase.txt", "--log-n", "10")
-        (self.path / "a.txt").unlink()
-        self.run_cli("decrypt", "a.txt.cipher", "-k", PHRASE)
-        self.assertEqual((self.path / "a.txt").read_text(), "file content")
+        proc = self.run_cli("decrypt", "a.txt.cipher", "-k", PHRASE)
+        self.assertEqual(proc.stdout, "file content")
 
     def test_missing_env_var_is_a_clean_error(self):
         (self.path / "a.txt").write_text("x")
@@ -214,7 +299,9 @@ class CommandLine(unittest.TestCase):
         self.run_cli("encrypt", *names, "-k", PHRASE, "--log-n", "10")
         for name in names:
             self.assertTrue((self.path / f"{name}.cipher").exists(), name)
-        self.run_cli("decrypt", *[f"{n}.cipher" for n in names], "-k", PHRASE, "--force")
+        self.run_cli(
+            "decrypt", *[f"{n}.cipher" for n in names], "-w", "-f", "-k", PHRASE
+        )
         for name in names:
             self.assertEqual((self.path / name).read_text(), f"contents of {name}")
 
@@ -241,7 +328,18 @@ class CommandLine(unittest.TestCase):
         self.run_cli("decrypt", "vault.bin", "-o", "back.txt", "-k", PHRASE)
         self.assertEqual((self.path / "back.txt").read_text(), "content")
 
-    def test_wrong_keyphrase_leaves_no_output(self):
+    def test_decrypt_refuses_to_overwrite_its_own_input(self):
+        """-o pointing at the .cipher file itself would destroy the vault."""
+        (self.path / "a.txt").write_text("content")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        before = (self.path / "a.txt.cipher").read_bytes()
+        self.run_cli(
+            "decrypt", "a.txt.cipher", "-o", "a.txt.cipher", "-f", "-k", PHRASE,
+            expect_ok=False,
+        )
+        self.assertEqual((self.path / "a.txt.cipher").read_bytes(), before)
+
+    def test_wrong_keyphrase_prints_nothing(self):
         (self.path / "a.txt").write_text("secret stuff")
         self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
         (self.path / "a.txt").unlink()
@@ -250,6 +348,16 @@ class CommandLine(unittest.TestCase):
             "decrypt", "a.txt.cipher", "-k", "the wrong keyphrase", expect_ok=False
         )
         self.assertIn("wrong keyphrase", proc.stderr)
+        self.assertEqual(proc.stdout, "", "leaked partial plaintext")
+
+    def test_wrong_keyphrase_leaves_no_output_file(self):
+        (self.path / "a.txt").write_text("secret stuff")
+        self.run_cli("encrypt", "a.txt", "-k", PHRASE, "--log-n", "10")
+        (self.path / "a.txt").unlink()
+
+        self.run_cli(
+            "decrypt", "a.txt.cipher", "-w", "-k", "the wrong one", expect_ok=False
+        )
         self.assertFalse((self.path / "a.txt").exists(), "wrote output despite failing")
 
     def test_remove_source(self):
