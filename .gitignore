@@ -1,0 +1,15 @@
+# Never commit real documents or vaults. This tool's whole job is handling
+# things that should not be in version control.
+*.txt
+!requirements.txt
+*.cipher
+*.decrypted
+*.key
+keyphrase*
+.*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
